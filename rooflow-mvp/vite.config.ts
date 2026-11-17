@@ -4,7 +4,14 @@ import tailwindcss from '@tailwindcss/vite'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import siteConfiguration from './.figma/make/site.json'
+// Optional: Figma Make generates this file; fall back to an empty config on a clean checkout.
+function loadSiteConfiguration(): FigmaSiteConfiguration {
+  try {
+    return JSON.parse(fs.readFileSync(path.resolve(__dirname, '.figma/make/site.json'), 'utf-8'))
+  } catch {
+    return {}
+  }
+}
 
 
 // Vite config — https://vitejs.dev/config/
@@ -21,7 +28,7 @@ export default defineConfig(({ mode }) => {
     plugins: [
 react(),
       tailwindcss(),
-      figmaSiteConfiguration(siteConfiguration),
+      figmaSiteConfiguration(loadSiteConfiguration()),
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
       figmaMakeKitPlugin({ storiesGlob: '/src/**/*.stories.{ts,tsx,js,jsx}' }),
