@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
 
 type Screen =
   | 'home'
@@ -657,8 +657,9 @@ function App() {
   const [seconds, setSeconds] = useState(0)
   const timerRef = useRef<number | null>(null)
   const recognitionRef = useRef<any>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
-  const finalRef = useRef('')
-  const speechErrorRef = useRef(false)
+  const committedRef = useRef('')
+  const sessionRef = useRef('')
+  const isRecordingRef = useRef(false)
 
   const showToast = (message: string) => {
     setToast(message)
@@ -700,8 +701,7 @@ function App() {
   const goHome = () => {
     setHistory([])
     setScreen('home')
-    setRecording(false)
-    try { recognitionRef.current?.abort() } catch { /* ignore */ }
+    cancelRecording()
   }
 
   const finish = (message: string) => {
@@ -750,48 +750,98 @@ function App() {
     [],
   )
 
-  const startRecording = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (!SpeechRec) return
-    event.currentTarget.setPointerCapture(event.pointerId)
-    setSpeechNote('')
-    setTranscript('')
-    finalRef.current = ''
-    speechErrorRef.current = false
+  const joinText = (a: string, b: string) => [a.trim(), b.trim()].filter(Boolean).join(' ')
+
+  const stopTimer = () => {
+    if (timerRef.current) window.clearInterval(timerRef.current)
+    timerRef.current = null
+  }
+
+  const createRecognition = () => {
     const rec = new SpeechRec()
     rec.lang = 'nl-NL'
     rec.continuous = true
     rec.interimResults = true
     rec.onresult = (e: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
-      let interim = ''
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const result = e.results[i]
-        if (result.isFinal) finalRef.current += result[0].transcript + ' '
-        else interim += result[0].transcript
-      }
-      setTranscript((finalRef.current + interim).trim())
+      if (!isRecordingRef.current) return
+      let text = ''
+      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript + ' '
+      sessionRef.current = text.trim()
+      setTranscript(joinText(committedRef.current, sessionRef.current))
     }
     rec.onerror = (e: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
       if (e.error === 'no-speech' || e.error === 'aborted') return
-      speechErrorRef.current = true
-      setSpeechNote(e.error === 'not-allowed' || e.error === 'service-not-allowed'
-        ? 'Geen toegang tot de microfoon. Typ je tekst hieronder.'
-        : 'Spraakherkenning mislukt. Typ je tekst hieronder.')
+      setSpeechNote(`Fout: ${e.error}${e.message ? ` (${e.message})` : ''}`)
+      isRecordingRef.current = false
+      setRecording(false)
+      stopTimer()
     }
-    recognitionRef.current = rec
-    try { rec.start() } catch { /* already started */ }
+    rec.onend = () => {
+      if (!isRecordingRef.current) return
+      // Safari ends the session after a short pause: keep the text and restart right away.
+      committedRef.current = joinText(committedRef.current, sessionRef.current)
+      sessionRef.current = ''
+      try {
+        rec.start()
+      } catch {
+        try {
+          recognitionRef.current = createRecognition()
+          recognitionRef.current.start()
+        } catch (err) {
+          setSpeechNote(`Fout: kon niet opnieuw starten (${String(err)})`)
+          isRecordingRef.current = false
+          setRecording(false)
+          stopTimer()
+        }
+      }
+    }
+    return rec
+  }
+
+  const cancelRecording = () => {
+    isRecordingRef.current = false
+    setRecording(false)
+    stopTimer()
+    try { recognitionRef.current?.abort() } catch { /* ignore */ }
+  }
+
+  const toggleRecording = () => {
+    if (!SpeechRec) return
+    if (isRecordingRef.current) {
+      const text = joinText(committedRef.current, sessionRef.current)
+      isRecordingRef.current = false
+      setRecording(false)
+      stopTimer()
+      try { recognitionRef.current?.stop() } catch { /* ignore */ }
+      setTranscript(text)
+      if (text) {
+        setSpeechNote('')
+        navigate('e-transcript')
+      } else {
+        setSpeechNote((note) => note || 'Geen tekst herkend. Tik opnieuw op de microfoon of typ hieronder.')
+      }
+      return
+    }
+    setSpeechNote('')
+    committedRef.current = transcript.trim()
+    sessionRef.current = ''
+    isRecordingRef.current = true
+    recognitionRef.current = createRecognition()
+    try {
+      recognitionRef.current.start()
+    } catch (err) {
+      isRecordingRef.current = false
+      setSpeechNote(`Fout: ${String(err)}`)
+      return
+    }
     setSeconds(0)
     setRecording(true)
     timerRef.current = window.setInterval(() => setSeconds((value) => value + 0.1), 100)
   }
 
-  const stopRecording = () => {
-    if (!recording) return
-    if (timerRef.current) window.clearInterval(timerRef.current)
-    timerRef.current = null
-    setRecording(false)
-    try { recognitionRef.current?.stop() } catch { /* ignore */ }
-    if (!speechErrorRef.current) navigate('e-loading')
-  }
+  useEffect(() => {
+    if (screen !== 'e-record' && isRecordingRef.current) cancelRecording()
+  }, [screen])
 
   const onPhotoChosen = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -1100,29 +1150,35 @@ function App() {
       {[18, 30, 44, 26, 55, 38, 62, 32, 48, 24, 42, 20].map((height, index) => <i key={index} style={{ '--wave-height': `${height}px`, '--delay': `${index * 0.06}s` } as React.CSSProperties} />)}
     </div>
     const unsupported = !SpeechRec
-    const note = unsupported ? 'Spraak werkt in Chrome of Safari' : speechNote
     const microphone = <>
-      {!unsupported && <>
-        {wave}
-        <div className="voice-timer">{seconds.toFixed(1).replace('.', ',')} sec</div>
-        <button className="mic-button" onPointerDown={startRecording} onPointerUp={stopRecording} onPointerCancel={stopRecording} aria-label="Houd ingedrukt om op te nemen">
-          <Icon name="mic" size={38} /><span />
-        </button>
-        <div className="hold-label">{recording ? 'Laat los om te stoppen' : 'Houd ingedrukt om te spreken'}</div>
-      </>}
-      {note && <div className="speech-note"><Icon name="warning" size={18} /> {note}</div>}
-      {note && (
-        <div className="speech-fallback">
-          <textarea className="transcript-edit" rows={4} value={transcript} onChange={(event) => setTranscript(event.target.value)} placeholder="Typ wat je ziet, bijv. bitumen dak, scheur van 1,8 meter, Icopal" />
-          <Button disabled={!transcript.trim()} onClick={() => navigate('e-transcript')}>Verwerk tekst</Button>
-        </div>
+      {unsupported ? (
+        <div className="speech-note"><Icon name="warning" size={18} /> Spraak werkt in Chrome of Safari</div>
+      ) : (
+        <>
+          {wave}
+          <div className="voice-timer">{seconds.toFixed(1).replace('.', ',')} sec</div>
+          <button className="mic-button" onClick={toggleRecording} aria-pressed={recording} aria-label={recording ? 'Tik om te stoppen' : 'Tik om te starten'}>
+            <Icon name="mic" size={38} /><span />
+          </button>
+          <div className="hold-label">{recording ? 'Tik om te stoppen' : 'Tik om te starten'}</div>
+          <div className="speech-status" aria-live="polite">
+            <strong>{recording ? 'Luisteren…' : 'Niet aan het opnemen'}</strong>
+            <p>{transcript || (recording ? 'Spreek maar, de tekst verschijnt hier.' : 'Je tekst verschijnt hier.')}</p>
+          </div>
+        </>
       )}
+      {speechNote && <div className="speech-note"><Icon name="warning" size={18} /> {speechNote}</div>}
+      <div className="speech-fallback">
+        <label className="speech-fallback-label" htmlFor="speech-typed">Of tik hier en gebruik de 🎙 van je toetsenbord</label>
+        <textarea id="speech-typed" className="transcript-edit" rows={3} readOnly={recording} value={transcript} onChange={(event) => setTranscript(event.target.value)} placeholder="bijv. bitumen dak, scheur van 1,8 meter, Icopal" />
+        <Button disabled={!transcript.trim() || recording} onClick={() => navigate('e-transcript')}>Verwerk tekst</Button>
+      </div>
     </>
     const live = parseSpeech(transcript)
     content = deviceMode === 'ipad' ? (
       <div className={`voice-ipad ${recording ? 'is-recording' : ''}`}>
         <div className="voice-ipad-left">
-          <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Spraak` : 'Spraak'} title="Vertel wat je ziet" intro="Houd de microfoon ingedrukt en spreek je waarneming in." />
+          <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Spraak` : 'Spraak'} title="Vertel wat je ziet" intro="Tik op de microfoon, spreek je waarneming in en tik opnieuw om te stoppen." />
           {microphone}
         </div>
         <div className="live-transcript">
@@ -1141,9 +1197,8 @@ function App() {
       </div>
     ) : (
       <div className={`voice-screen ${recording ? 'is-recording' : ''}`}>
-        <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Spraak` : 'Spraak'} title="Vertel wat je ziet" intro="Houd de microfoon ingedrukt en spreek je waarneming in." />
+        <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Spraak` : 'Spraak'} title="Vertel wat je ziet" intro="Tik op de microfoon, spreek je waarneming in en tik opnieuw om te stoppen." />
         {microphone}
-        {!unsupported && <div className="voice-live">{transcript || 'Je tekst verschijnt hier tijdens het opnemen.'}</div>}
         <div className="voice-tip"><Icon name="sparkles" size={18} /> Noem materiaal, merk, maat en aantal voor het beste resultaat.</div>
       </div>
     )
