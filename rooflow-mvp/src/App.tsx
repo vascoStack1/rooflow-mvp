@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 
 type Screen =
   | 'home'
@@ -105,6 +105,128 @@ const INSPECTIONS: Inspection[] = [
 
 const PHOTO =
   'https://images.unsplash.com/photo-1694415847950-973e7dcca94d?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixlib=rb-4.1.0&q=80&w=1080'
+
+type DefectStatus = 'Te controleren' | 'Gecontroleerd' | 'Definitief'
+const STATUS_ORDER: DefectStatus[] = ['Te controleren', 'Gecontroleerd', 'Definitief']
+
+type Defect = {
+  id: string
+  inspectionId: string | null
+  inspectionName: string
+  material: string
+  type: string
+  size: number
+  unit: string
+  brand: string
+  count: number
+  status: DefectStatus
+  photo?: string
+  source: 'vast' | 'spraak' | 'foto'
+  createdAt: string
+}
+
+type Draft = { material: string; type: string; size: string; unit: string; brand: string; count: string }
+
+const EMPTY_DRAFT: Draft = { material: '', type: '', size: '', unit: 'm²', brand: '', count: '1' }
+const MATERIALS = ['Bitumen', 'EPDM', 'PVC', 'Anders']
+const TYPES = ['Scheur', 'Vocht', 'Loszittend', 'Corrosie', 'Blaasvorming']
+const BRANDS = ['Icopal', 'Derbigum', 'Firestone', 'Anders']
+const UNITS = ['m²', 'm¹', 'st']
+const AI_SUGGESTION: Draft = { material: 'Bitumen', type: 'Scheur', size: '1,8', unit: 'm¹', brand: '', count: '1' }
+
+const DEFECTS_KEY = 'rooflow.defects.v1'
+const COMPLETED_KEY = 'rooflow.completed.v1'
+
+function loadStored<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return fallback
+    const value = JSON.parse(raw)
+    return Array.isArray(value) ? (value as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function saveStored(key: string, value: unknown): boolean {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const parseNum = (value: string) => {
+  const n = Number(value.replace(',', '.'))
+  return Number.isFinite(n) ? n : 0
+}
+const fmtNum = (n: number) => String(n).replace('.', ',')
+const fmtSize = (d: Defect) => `${fmtNum(d.size)} ${d.unit}`
+const statusClass = (status: string) => `s${status.replace(/ /g, '-').toLowerCase()}`
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+
+const NUM_WORDS: Record<string, string> = { nul: '0', één: '1', een: '1', twee: '2', drie: '3', vier: '4', vijf: '5', zes: '6', zeven: '7', acht: '8', negen: '9', tien: '10' }
+const NUM_WORD_PATTERN = Object.keys(NUM_WORDS).join('|')
+
+function parseSpeech(text: string): Draft {
+  const out: Draft = { ...EMPTY_DRAFT, count: '' }
+  let t = text.toLowerCase()
+  t = t.replace(new RegExp(`(?<!\\p{L})(${NUM_WORD_PATTERN})\\s+komma\\s+(${NUM_WORD_PATTERN})(?!\\p{L})`, 'gu'), (_m, a: string, b: string) => `${NUM_WORDS[a]},${NUM_WORDS[b]}`)
+  t = t.replace(new RegExp(`(?<!\\p{L})(${NUM_WORD_PATTERN})(?=\\s*(?:meter|vierkante|stuks?|keer)(?!\\p{L}))`, 'gu'), (w) => NUM_WORDS[w])
+
+  const material = t.match(/bitumen|bitumineus|epdm|pvc/)
+  if (material) out.material = material[0].startsWith('bitum') ? 'Bitumen' : material[0].toUpperCase()
+
+  const brand = t.match(/icopal|derbigum|firestone/)
+  if (brand) out.brand = brand[0][0].toUpperCase() + brand[0].slice(1)
+
+  if (/scheur/.test(t)) out.type = 'Scheur'
+  else if (/vocht|lek/.test(t)) out.type = 'Vocht'
+  else if (/blaas|blaren/.test(t)) out.type = 'Blaasvorming'
+  else if (/loszit|los /.test(t)) out.type = 'Loszittend'
+  else if (/corros|roest/.test(t)) out.type = 'Corrosie'
+
+  const size = t.match(/(\d+(?:[.,]\d+)?)\s*(vierkante\s*meter|vierkante|m²|m\s*2|strekkende\s*meter|m1|m¹|meter|m)(?!\p{L})/u)
+  if (size) {
+    out.size = size[1].replace('.', ',')
+    out.unit = /vierkante|²|2/.test(size[2]) ? 'm²' : 'm¹'
+  }
+
+  const count = t.match(/(\d+)\s*(?:stuks|stuk|keer)(?!\p{L})/u) ?? t.match(/aantal\s*(?:van\s*)?(\d+)/)
+  if (count) out.count = count[1]
+  return out
+}
+
+function resizeImage(file: File, maxWidth = 800): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      const scale = Math.min(1, maxWidth / img.width)
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.round(img.width * scale)
+      canvas.height = Math.round(img.height * scale)
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        URL.revokeObjectURL(url)
+        reject(new Error('canvas'))
+        return
+      }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+      URL.revokeObjectURL(url)
+      resolve(canvas.toDataURL('image/jpeg', 0.8))
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('image'))
+    }
+    img.src = url
+  })
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const SpeechRec: any = typeof window !== 'undefined' ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition : undefined
 
 function Icon({ name, size = 22 }: { name: IconName; size?: number }) {
   const common = {
@@ -302,6 +424,45 @@ function ChipGroup({
   )
 }
 
+function DraftFields({ draft, onChange }: { draft: Draft; onChange: (draft: Draft) => void }) {
+  const set = (patch: Partial<Draft>) => onChange({ ...draft, ...patch })
+  return (
+    <>
+      <div className="choice-section">
+        <div className="choice-title"><Icon name="warning" size={19} /> Type gebrek <span>*</span></div>
+        <ChipGroup options={TYPES} value={draft.type} onChange={(type) => set({ type })} />
+      </div>
+      <div className="choice-section">
+        <div className="choice-title"><Icon name="material" size={19} /> Materiaal</div>
+        <ChipGroup options={MATERIALS} value={draft.material} onChange={(material) => set({ material })} />
+      </div>
+      <div className="choice-section">
+        <div className="choice-title">Merk</div>
+        <ChipGroup options={BRANDS} value={draft.brand} onChange={(brand) => set({ brand })} />
+      </div>
+      <div className="choice-section">
+        <label className="choice-title" htmlFor="draft-size"><Icon name="ruler" size={19} /> Maat <span>*</span></label>
+        <div className="measure-row">
+          <div className="measure-input">
+            <input id="draft-size" value={draft.size} onChange={(event) => set({ size: event.target.value })} inputMode="decimal" placeholder="0,0" />
+            <span>{draft.unit}</span>
+          </div>
+          <div className="unit-picker">
+            {UNITS.map((item) => <button key={item} className={draft.unit === item ? 'selected' : ''} onClick={() => set({ unit: item })}>{item}</button>)}
+          </div>
+        </div>
+      </div>
+      <div className="choice-section">
+        <label className="choice-title" htmlFor="draft-count">Aantal</label>
+        <div className="measure-input">
+          <input id="draft-count" value={draft.count} onChange={(event) => set({ count: event.target.value.replace(/\D/g, '') })} inputMode="numeric" />
+          <span>st</span>
+        </div>
+      </div>
+    </>
+  )
+}
+
 function PlanningList({
   completed,
   selectedId,
@@ -430,16 +591,15 @@ function IpadSidebar({
   screen,
   onNavigate,
   activeInspection,
+  defects,
 }: {
   screen: Screen
   onNavigate: (screen: Screen) => void
   activeInspection?: Inspection
+  defects: Defect[]
 }) {
-  const defects = [
-    ['01', 'Scheurvorming', 'Gevel · 1,2 m¹'],
-    ['02', 'Vochtschade', 'Plafond · 0,8 m²'],
-    ['03', 'Loszittend voegwerk', 'Galerij · 3 st'],
-  ]
+  const scoped = activeInspection ? defects.filter((defect) => defect.inspectionId === activeInspection.id) : defects
+  const recent = scoped.slice(0, 3)
 
   return (
     <aside className="ipad-sidebar">
@@ -448,18 +608,18 @@ function IpadSidebar({
         <div><strong>RooFlow</strong><small>Schadenberg Dakwerken</small></div>
       </button>
       <div className="sidebar-project">
-        <div className="eyebrow">Actieve inspectie</div>
-        <div className="sidebar-project-title">{activeInspection?.name ?? 'Complex De Wilg'}</div>
-        <div className="sidebar-project-sub">{activeInspection?.address ?? 'Vleugel B · Tweede verdieping'}</div>
-        <div className="progress-head"><span>Voortgang</span><strong>6 van 18</strong></div>
-        <div className="progress-track"><span /></div>
+        <div className="eyebrow">{activeInspection ? 'Actieve inspectie' : 'Geen locatie gekoppeld'}</div>
+        <div className="sidebar-project-title">{activeInspection?.name ?? 'Losse gebreken'}</div>
+        <div className="sidebar-project-sub">{activeInspection?.address ?? 'Start een inspectie via Planning'}</div>
+        <div className="progress-head"><span>Gebreken</span><strong>{scoped.length}</strong></div>
       </div>
-      <div className="sidebar-list-head"><span>Woning B-24</span><small>3 gebreken</small></div>
+      <div className="sidebar-list-head"><span>Laatst toegevoegd</span><small>{scoped.length} totaal</small></div>
       <div className="sidebar-defects">
-        {defects.map(([number, title, meta]) => (
-          <button key={number} className="sidebar-defect" onClick={() => onNavigate('d-office')}>
-            <span>{number}</span>
-            <div><strong>{title}</strong><small>{meta}</small></div>
+        {recent.length === 0 && <small className="sidebar-empty">Nog geen gebreken</small>}
+        {recent.map((defect, index) => (
+          <button key={defect.id} className="sidebar-defect" onClick={() => onNavigate('d-office')}>
+            <span>{String(scoped.length - index).padStart(2, '0')}</span>
+            <div><strong>{defect.type}</strong><small>{defect.material || 'Materiaal onbekend'} · {fmtSize(defect)}</small></div>
             <Icon name="chevron" size={15} />
           </button>
         ))}
@@ -486,21 +646,45 @@ function App() {
   const [toast, setToast] = useState('')
   const [selectedPlanningId, setSelectedPlanningId] = useState<string | null>(null)
   const [activeInspectionId, setActiveInspectionId] = useState<string | null>(null)
-  const [completedInspections, setCompletedInspections] = useState<string[]>([])
+  const [completedInspections, setCompletedInspections] = useState<string[]>(() => loadStored<string[]>(COMPLETED_KEY, []))
+  const [defects, setDefects] = useState<Defect[]>(() => loadStored<Defect[]>(DEFECTS_KEY, []))
   const [safety, setSafety] = useState<Record<string, boolean>>({ Helm: false, Harnas: false, Ladder: false })
-  const [material, setMaterial] = useState('')
-  const [defectType, setDefectType] = useState('')
-  const [measure, setMeasure] = useState(0)
-  const [unit, setUnit] = useState('m²')
-  const [statuses, setStatuses] = useState(['Te controleren', 'Gecontroleerd', 'Definitief'])
+  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT)
+  const [draftPhoto, setDraftPhoto] = useState<string | null>(null)
+  const [transcript, setTranscript] = useState('')
+  const [speechNote, setSpeechNote] = useState('')
   const [recording, setRecording] = useState(false)
   const [seconds, setSeconds] = useState(0)
-  const [flash, setFlash] = useState(false)
-  const [photoType, setPhotoType] = useState('Scheurvorming')
-  const [photoMeasure, setPhotoMeasure] = useState('1,8')
   const timerRef = useRef<number | null>(null)
+  const recognitionRef = useRef<any>(null) // eslint-disable-line @typescript-eslint/no-explicit-any
+  const finalRef = useRef('')
+  const speechErrorRef = useRef(false)
+
+  const showToast = (message: string) => {
+    setToast(message)
+    window.setTimeout(() => setToast(''), 2800)
+  }
+
+  useEffect(() => {
+    if (!saveStored(DEFECTS_KEY, defects)) showToast('Opslaan mislukt: opslag is vol')
+  }, [defects])
+
+  useEffect(() => {
+    saveStored(COMPLETED_KEY, completedInspections)
+  }, [completedInspections])
+
+  const resetDraft = () => {
+    setDraft(EMPTY_DRAFT)
+    setDraftPhoto(null)
+    setTranscript('')
+    setSpeechNote('')
+    setSeconds(0)
+  }
 
   const navigate = (next: Screen) => {
+    const flowOf = (s: Screen) => (/^[def]-/.test(s) ? s[0] : 'x')
+    const entry: Partial<Record<Screen, string>> = { 'd-defect': 'd', 'e-record': 'e', 'f-camera': 'f' }
+    if (entry[next] && flowOf(screen) !== entry[next]) resetDraft()
     setHistory((current) => [...current, screen])
     setScreen(next)
   }
@@ -517,20 +701,16 @@ function App() {
     setHistory([])
     setScreen('home')
     setRecording(false)
+    try { recognitionRef.current?.abort() } catch { /* ignore */ }
   }
 
   const finish = (message: string) => {
     if (activeInspectionId) {
       setCompletedInspections((current) => current.includes(activeInspectionId) ? current : [...current, activeInspectionId])
     }
+    setActiveInspectionId(null)
     goHome()
-    setToast(message)
-    window.setTimeout(() => setToast(''), 2800)
-  }
-
-  const showToast = (message: string) => {
-    setToast(message)
-    window.setTimeout(() => setToast(''), 2800)
+    showToast(message)
   }
 
   const selectPlanningInspection = (inspection: Inspection) => {
@@ -571,7 +751,34 @@ function App() {
   )
 
   const startRecording = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!SpeechRec) return
     event.currentTarget.setPointerCapture(event.pointerId)
+    setSpeechNote('')
+    setTranscript('')
+    finalRef.current = ''
+    speechErrorRef.current = false
+    const rec = new SpeechRec()
+    rec.lang = 'nl-NL'
+    rec.continuous = true
+    rec.interimResults = true
+    rec.onresult = (e: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+      let interim = ''
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const result = e.results[i]
+        if (result.isFinal) finalRef.current += result[0].transcript + ' '
+        else interim += result[0].transcript
+      }
+      setTranscript((finalRef.current + interim).trim())
+    }
+    rec.onerror = (e: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+      if (e.error === 'no-speech' || e.error === 'aborted') return
+      speechErrorRef.current = true
+      setSpeechNote(e.error === 'not-allowed' || e.error === 'service-not-allowed'
+        ? 'Geen toegang tot de microfoon. Typ je tekst hieronder.'
+        : 'Spraakherkenning mislukt. Typ je tekst hieronder.')
+    }
+    recognitionRef.current = rec
+    try { rec.start() } catch { /* already started */ }
     setSeconds(0)
     setRecording(true)
     timerRef.current = window.setInterval(() => setSeconds((value) => value + 0.1), 100)
@@ -582,24 +789,76 @@ function App() {
     if (timerRef.current) window.clearInterval(timerRef.current)
     timerRef.current = null
     setRecording(false)
-    navigate('e-loading')
+    try { recognitionRef.current?.stop() } catch { /* ignore */ }
+    if (!speechErrorRef.current) navigate('e-loading')
   }
 
-  const takePhoto = () => {
-    setFlash(true)
-    window.setTimeout(() => {
-      setFlash(false)
+  const onPhotoChosen = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    try {
+      const photo = await resizeImage(file, 800)
+      setDraftPhoto(photo)
+      setDraft(AI_SUGGESTION)
       navigate('f-loading')
-    }, 220)
+    } catch {
+      showToast('Foto laden mislukt, probeer opnieuw')
+    }
   }
 
-  const cycleStatus = (index: number) => {
-    const order = ['Te controleren', 'Gecontroleerd', 'Definitief']
-    setStatuses((current) =>
-      current.map((status, statusIndex) =>
-        statusIndex === index ? order[(order.indexOf(status) + 1) % order.length] : status,
+  const draftValid = Boolean(draft.type && parseNum(draft.size) > 0)
+
+  const saveDefect = (source: Defect['source']) => {
+    const defect: Defect = {
+      id: newId(),
+      inspectionId: activeInspection?.id ?? null,
+      inspectionName: activeInspection?.name ?? 'Geen locatie',
+      material: draft.material,
+      type: draft.type,
+      size: parseNum(draft.size),
+      unit: draft.unit,
+      brand: draft.brand,
+      count: Math.max(1, parseInt(draft.count, 10) || 1),
+      status: 'Te controleren',
+      photo: source === 'foto' ? (draftPhoto ?? undefined) : undefined,
+      source,
+      createdAt: new Date().toISOString(),
+    }
+    setDefects((current) => [defect, ...current])
+    resetDraft()
+    navigate('d-office')
+    showToast('Gebrek opgeslagen')
+  }
+
+  const cycleStatus = (id: string) => {
+    setDefects((current) =>
+      current.map((defect) =>
+        defect.id === id ? { ...defect, status: STATUS_ORDER[(STATUS_ORDER.indexOf(defect.status) + 1) % STATUS_ORDER.length] } : defect,
       ),
     )
+  }
+
+  const exportBaudex = () => {
+    const payload = {
+      system: 'RooFlow',
+      exportedAt: new Date().toISOString(),
+      inspections: INSPECTIONS.filter((inspection) => defects.some((defect) => defect.inspectionId === inspection.id)).map((inspection) => ({
+        ...inspection,
+        completed: completedInspections.includes(inspection.id),
+      })),
+      defects,
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `rooflow-baudex-${new Date().toISOString().slice(0, 10)}.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    showToast('Export gedownload')
   }
 
   const titleByScreen: Partial<Record<Screen, string>> = {
@@ -615,11 +874,12 @@ function App() {
     'e-check': 'Controle',
     'f-camera': 'Foto maken',
     'f-loading': 'Foto analyseren',
-    'f-result': 'AI-resultaat',
+    'f-result': 'AI-suggestie',
     'f-confirm': 'Controleren',
   }
 
-  const requiredComplete = Boolean(material && defectType && measure > 0)
+  const sizeStep = (delta: number) =>
+    setDraft((current) => ({ ...current, size: fmtNum(Math.max(0, Number((parseNum(current.size) + delta).toFixed(1)))) }))
 
   let content: ReactNode
 
@@ -627,7 +887,7 @@ function App() {
     const tiles: { title: string; sub: string; icon: IconName; target: Screen; tone: string }[] = [
       { title: 'Vaste velden', sub: 'Snel registreren', icon: 'list', target: deviceMode === 'ipad' ? 'd-defect' : 'd-inspection', tone: 'd-green' },
       { title: 'Spraak', sub: 'Vertel wat je ziet', icon: 'mic', target: 'e-record', tone: 'e-petrol' },
-      { title: 'Foto', sub: 'AI-herkenning', icon: 'camera', target: 'f-camera', tone: 'f-yellow' },
+      { title: 'Foto', sub: 'Camera + suggestie', icon: 'camera', target: 'f-camera', tone: 'f-yellow' },
     ]
     content = (
       <div className="home-screen">
@@ -649,7 +909,7 @@ function App() {
         </div>
         <div className="tile-grid">
           {tiles.map((tile) => (
-            <button key={tile.title} className={`solution-tile ${tile.tone}`} onClick={() => navigate(tile.target)}>
+            <button key={tile.title} className={`solution-tile ${tile.tone}`} onClick={() => { setActiveInspectionId(null); navigate(tile.target) }}>
               <div className="tile-top">
                 <span className="tile-arrow"><Icon name="chevron" size={18} /></span>
               </div>
@@ -664,6 +924,14 @@ function App() {
           <div>
             <div className="small-label">Vandaag</div>
             <div className="today-title">{completedInspections.length ? `${completedInspections.length} van 3 afgerond` : '3 inspecties gepland'}</div>
+          </div>
+          <Icon name="chevron" size={18} />
+        </button>
+        <button className="today-card" onClick={() => { setActiveInspectionId(null); navigate('d-office') }}>
+          <div className="today-icon"><Icon name="list" size={22} /></div>
+          <div>
+            <div className="small-label">Kantoorweergave</div>
+            <div className="today-title">{defects.length} {defects.length === 1 ? 'gebrek' : 'gebreken'} opgeslagen</div>
           </div>
           <Icon name="chevron" size={18} />
         </button>
@@ -722,24 +990,20 @@ function App() {
       </div>
     )
   } else if (screen === 'd-inspection') {
+    const scoped = activeInspection ? defects.filter((defect) => defect.inspectionId === activeInspection.id) : defects
     content = (
       <div className="screen-content">
-        <SectionTitle eyebrow="Vaste velden" title={activeInspection?.name ?? 'Complex De Wilg'} intro={activeInspection?.address ?? 'Vleugel B · Tweede verdieping'} />
+        <SectionTitle eyebrow="Vaste velden" title={activeInspection?.name ?? 'Losse gebreken'} intro={activeInspection?.address ?? 'Geen locatie gekoppeld'} />
         <div className="progress-card">
-          <div className="progress-head"><span>Inspectievoortgang</span><strong>6 van 18</strong></div>
-          <div className="progress-track"><span /></div>
+          <div className="progress-head"><span>Geregistreerde gebreken</span><strong>{scoped.length}</strong></div>
         </div>
-        <div className="room-heading"><div>Woning B-24</div><span>2 gebreken</span></div>
-        <div className="defect-row">
-          <div className="defect-number">01</div>
-          <div><strong>Scheurvorming</strong><span>Gevel · 1,2 m¹</span></div>
-          <span className="severity low">Laag</span>
-        </div>
-        <div className="defect-row">
-          <div className="defect-number">02</div>
-          <div><strong>Vochtschade</strong><span>Plafond · 0,8 m²</span></div>
-          <span className="severity medium">Middel</span>
-        </div>
+        {scoped.map((defect, index) => (
+          <div className="defect-row" key={defect.id}>
+            <div className="defect-number">{String(scoped.length - index).padStart(2, '0')}</div>
+            <div><strong>{defect.type}</strong><span>{defect.material || 'Materiaal onbekend'} · {fmtSize(defect)}</span></div>
+            <span className="severity low">{defect.status}</span>
+          </div>
+        ))}
         <button className="add-defect-card" onClick={() => navigate('d-defect')}>
           <span><Icon name="plus" size={23} /></span>
           <div><strong>Gebrek toevoegen</strong><small>Registreer een nieuwe waarneming</small></div>
@@ -750,89 +1014,111 @@ function App() {
   } else if (screen === 'd-defect') {
     content = (
       <div className="screen-content">
-        <SectionTitle eyebrow={activeInspection?.name ?? 'Woning B-24'} title="Type en maat" intro="Selecteer de vaste kenmerken van het gebrek." />
+        <SectionTitle eyebrow={activeInspection?.name ?? 'Geen locatie gekoppeld'} title="Type en maat" intro="Selecteer de vaste kenmerken van het gebrek." />
         <div className="step-line"><span className="active">1</span><i /><span>2</span><i /><span>3</span></div>
         <div className="choice-section">
-          <div className="choice-title"><Icon name="material" size={19} /> Materiaal <span>*</span></div>
-          <ChipGroup options={['Baksteen', 'Beton', 'Hout', 'Staal']} value={material} onChange={setMaterial} />
+          <div className="choice-title"><Icon name="material" size={19} /> Materiaal</div>
+          <ChipGroup options={MATERIALS} value={draft.material} onChange={(material) => setDraft({ ...draft, material })} />
+        </div>
+        <div className="choice-section">
+          <div className="choice-title">Merk</div>
+          <ChipGroup options={BRANDS} value={draft.brand} onChange={(brand) => setDraft({ ...draft, brand })} />
         </div>
         <div className="d-detail-grid">
           <div className="choice-section">
             <div className="choice-title"><Icon name="warning" size={19} /> Type gebrek <span>*</span></div>
-            <ChipGroup options={['Scheur', 'Vocht', 'Loszittend', 'Corrosie']} value={defectType} onChange={setDefectType} />
+            <ChipGroup options={TYPES} value={draft.type} onChange={(type) => setDraft({ ...draft, type })} />
           </div>
           <div className="choice-section">
             <div className="choice-title"><Icon name="ruler" size={19} /> Maat <span>*</span></div>
             <div className="measure-row">
               <div className="stepper">
-                <button onClick={() => setMeasure((value) => Math.max(0, Number((value - 0.1).toFixed(1))))} aria-label="Maat verlagen">−</button>
-                <strong>{measure.toFixed(1).replace('.', ',')}</strong>
-                <button onClick={() => setMeasure((value) => Number((value + 0.1).toFixed(1)))} aria-label="Maat verhogen">+</button>
+                <button onClick={() => sizeStep(-0.1)} aria-label="Maat verlagen">−</button>
+                <strong>{parseNum(draft.size).toFixed(1).replace('.', ',')}</strong>
+                <button onClick={() => sizeStep(0.1)} aria-label="Maat verhogen">+</button>
               </div>
               <div className="unit-picker">
-                {['m²', 'm¹', 'st'].map((item) => <button key={item} className={unit === item ? 'selected' : ''} onClick={() => setUnit(item)}>{item}</button>)}
+                {UNITS.map((item) => <button key={item} className={draft.unit === item ? 'selected' : ''} onClick={() => setDraft({ ...draft, unit: item })}>{item}</button>)}
               </div>
             </div>
           </div>
         </div>
-        {!requiredComplete && <div className="required-note">Vul materiaal, type en een maat groter dan 0 in.</div>}
-        <Button disabled={!requiredComplete} onClick={() => navigate('d-office')}>Volgende</Button>
+        {!draftValid && <div className="required-note">Vul type en een maat groter dan 0 in.</div>}
+        <Button disabled={!draftValid} onClick={() => saveDefect('vast')}>Volgende</Button>
       </div>
     )
   } else if (screen === 'd-office') {
-    const rows = [
-      ['Scheur boven kozijn', 'Baksteen', 'Scheur', '1,2 m¹', 'Sika', '1'],
-      ['Vochtplek plafond', 'Beton', 'Vocht', '0,8 m²', 'Remmers', '2'],
-      ['Los voegwerk', material || 'Baksteen', defectType || 'Scheur', `${measure.toFixed(1).replace('.', ',')} ${unit}`, 'Weber', '3'],
-    ]
-    const sendButton = <Button variant="dark" icon="send" onClick={() => activeInspectionId ? finish('Inspectie afgerond en verzonden') : showToast('Verzonden naar Baudex')}>Naar Baudex (API)</Button>
+    const total = defects.length
+    const checked = defects.filter((defect) => defect.status !== 'Te controleren').length
+    const canFinish = activeInspection && !completedInspections.includes(activeInspection.id)
+    const exportButton = <Button variant="dark" icon="send" onClick={exportBaudex} disabled={total === 0}>Export naar Baudex</Button>
+    const thumb = (defect: Defect) => defect.photo ? <img className="office-thumb" src={defect.photo} alt={`Foto ${defect.type}`} /> : <span className="office-thumb empty"><Icon name="camera" size={16} /></span>
     content = (
       <div className="screen-content office">
         <div className="office-title-row">
           <SectionTitle eyebrow="Ellen de Groot, Sales · Controle & overdracht" title="Kantoorweergave" intro="Tik op een status om deze te wijzigen." />
-          {deviceMode === 'ipad' && <div className="office-send">{sendButton}</div>}
+          {deviceMode === 'ipad' && <div className="office-send">{exportButton}</div>}
         </div>
         <div className="office-stats">
-          <div><strong>18</strong><span>Gebreken</span></div><div><strong>11</strong><span>Gecontroleerd</span></div><div><strong>7</strong><span>Openstaand</span></div>
+          <div><strong>{total}</strong><span>Gebreken</span></div><div><strong>{checked}</strong><span>Gecontroleerd</span></div><div><strong>{total - checked}</strong><span>Openstaand</span></div>
         </div>
-        {deviceMode === 'ipad' ? (
-          <div className="office-table">
-            <div className="office-table-head"><span>Gebrek</span><span>Materiaal</span><span>Type</span><span>Maat</span><span>Merk</span><span>Aantal</span><span>Status</span></div>
-            {rows.map((row, index) => (
-              <div className="office-table-row" key={row[0]}>
-                {row.map((cell) => <span key={cell}>{cell}</span>)}
-                <button className={`status-button s${statuses[index].replaceAll(' ', '-').toLowerCase()}`} onClick={() => cycleStatus(index)}>{statuses[index]}</button>
+        {total === 0 ? (
+          <div className="office-empty">Nog geen gebreken. Registreer er een via Vaste velden, Spraak of Foto.</div>
+        ) : deviceMode === 'ipad' ? (
+          <div className="office-table live">
+            <div className="office-table-head"><span>Foto</span><span>Locatie</span><span>Type</span><span>Materiaal</span><span>Maat</span><span>Merk</span><span>Aantal</span><span>Status</span></div>
+            {defects.map((defect) => (
+              <div className="office-table-row" key={defect.id}>
+                {thumb(defect)}
+                <span>{defect.inspectionName}</span>
+                <span>{defect.type}</span>
+                <span>{defect.material || '—'}</span>
+                <span>{fmtSize(defect)}</span>
+                <span>{defect.brand || '—'}</span>
+                <span>{defect.count}</span>
+                <button className={`status-button ${statusClass(defect.status)}`} onClick={() => cycleStatus(defect.id)}>{defect.status}</button>
               </div>
             ))}
           </div>
         ) : (
-          <>
-            <div className="office-list">
-              {rows.map((row, index) => (
-                <div className="office-row" key={row[0]}>
-                  <div className="office-index">{String(index + 1).padStart(2, '0')}</div>
-                  <div className="office-copy"><small>B-{24 + index}</small><strong>{row[0]}</strong><span>{row[1]} · {row[3]}</span></div>
-                  <button className={`status-button s${statuses[index].replaceAll(' ', '-').toLowerCase()}`} onClick={() => cycleStatus(index)}>{statuses[index]}</button>
-                </div>
-              ))}
-            </div>
-            {sendButton}
-          </>
+          <div className="office-list">
+            {defects.map((defect, index) => (
+              <div className="office-row" key={defect.id}>
+                {defect.photo ? thumb(defect) : <div className="office-index">{String(defects.length - index).padStart(2, '0')}</div>}
+                <div className="office-copy"><small>{defect.inspectionName}</small><strong>{defect.type}</strong><span>{defect.material || 'Materiaal onbekend'} · {fmtSize(defect)}{defect.brand ? ` · ${defect.brand}` : ''}</span></div>
+                <button className={`status-button ${statusClass(defect.status)}`} onClick={() => cycleStatus(defect.id)}>{defect.status}</button>
+              </div>
+            ))}
+          </div>
         )}
+        {deviceMode === 'phone' && exportButton}
+        {canFinish && <Button variant="secondary" onClick={() => finish('Inspectie afgerond')}>Inspectie afronden</Button>}
       </div>
     )
   } else if (screen === 'e-record') {
     const wave = <div className="wave" aria-hidden="true">
       {[18, 30, 44, 26, 55, 38, 62, 32, 48, 24, 42, 20].map((height, index) => <i key={index} style={{ '--wave-height': `${height}px`, '--delay': `${index * 0.06}s` } as React.CSSProperties} />)}
     </div>
+    const unsupported = !SpeechRec
+    const note = unsupported ? 'Spraak werkt in Chrome of Safari' : speechNote
     const microphone = <>
-      {wave}
-      <div className="voice-timer">{seconds.toFixed(1).replace('.', ',')} sec</div>
-      <button className="mic-button" onPointerDown={startRecording} onPointerUp={stopRecording} onPointerCancel={stopRecording} aria-label="Houd ingedrukt om op te nemen">
-        <Icon name="mic" size={38} /><span />
-      </button>
-      <div className="hold-label">{recording ? 'Laat los om te stoppen' : 'Houd ingedrukt om te spreken'}</div>
+      {!unsupported && <>
+        {wave}
+        <div className="voice-timer">{seconds.toFixed(1).replace('.', ',')} sec</div>
+        <button className="mic-button" onPointerDown={startRecording} onPointerUp={stopRecording} onPointerCancel={stopRecording} aria-label="Houd ingedrukt om op te nemen">
+          <Icon name="mic" size={38} /><span />
+        </button>
+        <div className="hold-label">{recording ? 'Laat los om te stoppen' : 'Houd ingedrukt om te spreken'}</div>
+      </>}
+      {note && <div className="speech-note"><Icon name="warning" size={18} /> {note}</div>}
+      {note && (
+        <div className="speech-fallback">
+          <textarea className="transcript-edit" rows={4} value={transcript} onChange={(event) => setTranscript(event.target.value)} placeholder="Typ wat je ziet, bijv. bitumen dak, scheur van 1,8 meter, Icopal" />
+          <Button disabled={!transcript.trim()} onClick={() => navigate('e-transcript')}>Verwerk tekst</Button>
+        </div>
+      )}
     </>
+    const live = parseSpeech(transcript)
     content = deviceMode === 'ipad' ? (
       <div className={`voice-ipad ${recording ? 'is-recording' : ''}`}>
         <div className="voice-ipad-left">
@@ -842,14 +1128,14 @@ function App() {
         <div className="live-transcript">
           <div className="live-heading"><span><i className={recording ? 'active' : ''} /> Live transcriptie</span><small>{recording ? 'Luistert…' : 'Klaar voor opname'}</small></div>
           <div className={`live-copy ${recording ? 'speaking' : ''}`}>
-            {seconds > 2.8 ? 'Op de gemetselde gevel boven het kozijn zit een verticale scheur van ongeveer één komma acht meter.' : seconds > 1.2 ? 'Op de gemetselde gevel boven het kozijn…' : recording ? 'Op de gemetselde gevel…' : 'Je gesproken tekst verschijnt hier tijdens het opnemen.'}
+            {transcript || 'Je gesproken tekst verschijnt hier tijdens het opnemen.'}
           </div>
           <div className="live-fields-title"><Icon name="sparkles" size={17} /> Herkende velden</div>
           <div className="live-fields">
-            <div><span>Bouwdeel</span><strong>{seconds > 1.2 ? 'Gevel' : '—'}</strong></div>
-            <div><span>Materiaal</span><strong>{seconds > 2 ? 'Baksteen' : '—'}</strong></div>
-            <div><span>Type</span><strong>{seconds > 2.8 ? 'Scheur' : '—'}</strong></div>
-            <div><span>Maat</span><strong>{seconds > 3.5 ? '1,8 m¹' : '—'}</strong></div>
+            <div><span>Materiaal</span><strong>{live.material || '—'}</strong></div>
+            <div><span>Maat</span><strong>{live.size ? `${live.size} ${live.unit}` : '—'}</strong></div>
+            <div><span>Merk</span><strong>{live.brand || '—'}</strong></div>
+            <div><span>Aantal</span><strong>{live.count || '—'}</strong></div>
           </div>
         </div>
       </div>
@@ -857,7 +1143,8 @@ function App() {
       <div className={`voice-screen ${recording ? 'is-recording' : ''}`}>
         <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Spraak` : 'Spraak'} title="Vertel wat je ziet" intro="Houd de microfoon ingedrukt en spreek je waarneming in." />
         {microphone}
-        <div className="voice-tip"><Icon name="sparkles" size={18} /> Noem bouwdeel, materiaal, gebrek en maat voor het beste resultaat.</div>
+        {!unsupported && <div className="voice-live">{transcript || 'Je tekst verschijnt hier tijdens het opnemen.'}</div>}
+        <div className="voice-tip"><Icon name="sparkles" size={18} /> Noem materiaal, merk, maat en aantal voor het beste resultaat.</div>
       </div>
     )
   } else if (screen === 'e-loading' || screen === 'f-loading') {
@@ -868,50 +1155,48 @@ function App() {
           <div className="loader-core"><Icon name={isVoice ? 'mic' : 'sparkles'} size={30} /></div>
           <span /><span /><span />
         </div>
-        <SectionTitle title={isVoice ? 'We luisteren…' : 'Foto analyseren…'} intro={isVoice ? 'Je opname wordt omgezet naar tekst.' : 'AI zoekt naar materialen en gebreken.'} />
+        <SectionTitle title={isVoice ? 'We luisteren…' : 'Foto verwerken…'} intro={isVoice ? 'Je opname wordt omgezet naar tekst.' : 'Een voorbeeld-suggestie wordt klaargezet.'} />
         <div className="loading-line"><span /></div>
       </div>
     )
   } else if (screen === 'e-transcript') {
+    const found = Object.entries(parseSpeech(transcript)).filter(([key, value]) => key !== 'unit' && value).length
     content = (
       <div className="screen-content">
-        <SectionTitle eyebrow="Automatisch uitgeschreven" title="Transcriptie" intro="Controleer kort of we je goed hebben verstaan." />
+        <SectionTitle eyebrow="Automatisch uitgeschreven" title="Transcriptie" intro="Controleer de tekst en pas hem aan waar nodig." />
         <div className="transcript-card">
           <div className="quote-mark">“</div>
-          <p>Op de gemetselde gevel boven het kozijn zit een verticale scheur van ongeveer één komma acht meter. Het gebrek bevindt zich op de tweede verdieping en heeft middelhoge urgentie.</p>
-          <button aria-label="Transcriptie bewerken"><Icon name="edit" size={18} /> Bewerken</button>
+          <textarea className="transcript-edit" rows={6} value={transcript} onChange={(event) => setTranscript(event.target.value)} placeholder="Geen tekst herkend. Typ hier wat je ziet." aria-label="Transcriptie bewerken" />
         </div>
-        <div className="detected"><Icon name="sparkles" size={17} /> 4 velden herkend</div>
+        <div className="detected"><Icon name="sparkles" size={17} /> {found} {found === 1 ? 'veld' : 'velden'} herkend</div>
         <div className="button-stack">
-          <Button onClick={() => navigate('e-check')}>Velden invullen</Button>
-          <Button variant="secondary" onClick={() => { setSeconds(0); navigate('e-record') }}>Opnieuw</Button>
+          <Button disabled={!transcript.trim()} onClick={() => { setDraft({ ...parseSpeech(transcript), count: parseSpeech(transcript).count || '1' }); navigate('e-check') }}>Velden invullen</Button>
+          <Button variant="secondary" onClick={() => { setTranscript(''); setSeconds(0); navigate('e-record') }}>Opnieuw</Button>
         </div>
       </div>
     )
   } else if (screen === 'e-check') {
-    const fields = [['Bouwdeel', 'Gevel'], ['Materiaal', 'Baksteen'], ['Type gebrek', 'Scheurvorming'], ['Maat', '1,8 m¹'], ['Urgentie', 'Middelhoog']]
     content = (
       <div className="screen-content">
-        <SectionTitle eyebrow="Controle" title="Klopt dit zo?" intro="De herkende velden staan klaar om op te slaan." />
-        <div className="recognized-card">
-          {fields.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong><Icon name="check" size={16} /></div>)}
-        </div>
-        <Button onClick={() => finish('Gebrek opgeslagen')} icon="check">Bevestig</Button>
+        <SectionTitle eyebrow="Controle" title="Klopt dit zo?" intro="Pas de herkende velden aan als dat nodig is." />
+        <DraftFields draft={draft} onChange={setDraft} />
+        {!draftValid && <div className="required-note">Vul type en een maat groter dan 0 in.</div>}
+        <Button onClick={() => saveDefect('spraak')} icon="check" disabled={!draftValid}>Bevestig</Button>
         <Button variant="secondary" onClick={() => navigate('e-record')}>Opnieuw</Button>
       </div>
     )
   } else if (screen === 'f-camera') {
     const camera = (
       <div className="camera-screen">
-        <img src={PHOTO} alt="Scheur in een witte buitenmuur" />
+        <img src={PHOTO} alt="Voorbeeld van een scheur in een buitenmuur" />
         {activeInspection && <div className="camera-location"><Icon name="pin" size={14} /> {activeInspection.name}</div>}
-        <div className={`camera-flash ${flash ? 'visible' : ''}`} />
         <div className="camera-guide"><span /><span /><span /><span /></div>
-        <div className="camera-hint">Breng het gebrek duidelijk in beeld</div>
-        <div className="camera-controls">
-          <button className="gallery-thumb" aria-label="Open galerij"><img src={PHOTO} alt="" /></button>
-          <button className="shutter" onClick={takePhoto} aria-label="Maak foto"><span /></button>
-          <button className="camera-switch" aria-label="Wissel camera">↻</button>
+        <div className="camera-hint">Tik op de sluiter om de camera te openen</div>
+        <div className="camera-controls single">
+          <label className="shutter" aria-label="Maak foto">
+            <input className="sr-only" type="file" accept="image/*" capture="environment" onChange={onPhotoChosen} />
+            <span />
+          </label>
         </div>
       </div>
     )
@@ -920,68 +1205,43 @@ function App() {
         <div className="ipad-camera-panel">{camera}</div>
         <div className="ipad-ai-panel">
           <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Foto` : 'Foto'} title="Maak een foto" intro="Zorg dat het gebrek scherp en volledig in beeld staat." />
-          <div className="ai-waiting"><span><Icon name="sparkles" size={28} /></span><strong>Klaar voor analyse</strong><p>Na het maken van de foto verschijnen het materiaal, type gebrek en de geschatte maat hier.</p></div>
-          <div className="camera-checks"><div><Icon name="check" size={15} /> Voldoende licht</div><div><Icon name="check" size={15} /> Gebrek binnen kader</div></div>
+          <div className="ai-waiting"><span><Icon name="sparkles" size={28} /></span><strong>Klaar voor foto</strong><p>Na de foto verschijnt hier een AI-suggestie (voorbeeld) die je zelf bevestigt of aanpast.</p></div>
         </div>
       </div>
     ) : camera
   } else if (screen === 'f-result') {
     const resultDetails = <>
-      <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · AI-herkenning` : 'Foto · AI-herkenning'} title="Gebrek gevonden" intro="We hebben de foto geanalyseerd." />
+      <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · Foto` : 'Foto'} title="AI-suggestie" intro="Dit is een voorbeeldwaarde. Bevestig of pas hem aan." />
       <div className="ai-card">
-        <div className="ai-heading"><span><Icon name="sparkles" size={18} /></span><div><small>Waarschijnlijk</small><strong>Scheurvorming</strong></div><b>92%</b></div>
-        <div className="ai-grid"><div><span>Materiaal</span><strong>Stucwerk</strong></div><div><span>Geschatte maat</span><strong>1,8 m¹</strong></div></div>
+        <div className="ai-heading"><span><Icon name="sparkles" size={18} /></span><div><small>Suggestie</small><strong>{AI_SUGGESTION.type}</strong></div><b>Voorbeeld</b></div>
+        <div className="ai-grid"><div><span>Materiaal</span><strong>{AI_SUGGESTION.material}</strong></div><div><span>Geschatte maat</span><strong>{AI_SUGGESTION.size} {AI_SUGGESTION.unit}</strong></div></div>
       </div>
-      {deviceMode === 'ipad' && <div className="confidence-bars">
-        <div><span><b>Scheurvorming</b><small>92%</small></span><i><em style={{ width: '92%' }} /></i></div>
-        <div><span><b>Vochtschade</b><small>18%</small></span><i><em style={{ width: '18%' }} /></i></div>
-        <div><span><b>Loszittend</b><small>7%</small></span><i><em style={{ width: '7%' }} /></i></div>
-      </div>}
       <Button onClick={() => navigate('f-confirm')}>Controleren</Button>
     </>
+    const photo = <div className="analysis-photo"><img src={draftPhoto ?? PHOTO} alt="Jouw foto van het gebrek" /></div>
     content = deviceMode === 'ipad' ? (
       <div className="photo-ipad result">
-        <div className="ipad-result-photo">
-          <div className="analysis-photo"><img src={PHOTO} alt="Geanalyseerde scheur in een witte buitenmuur" /><span className="focus-box"><i>92%</i></span></div>
-        </div>
+        <div className="ipad-result-photo">{photo}</div>
         <div className="ipad-ai-panel">{resultDetails}</div>
       </div>
     ) : (
       <div className="screen-content photo-result">
-        <SectionTitle eyebrow={activeInspection ? `${activeInspection.name} · AI-herkenning` : 'Foto · AI-herkenning'} title="Gebrek gevonden" intro="We hebben de foto geanalyseerd." />
-        <div className="analysis-photo">
-          <img src={PHOTO} alt="Geanalyseerde scheur in een witte buitenmuur" />
-          <span className="focus-box"><i>92%</i></span>
-        </div>
-        <div className="ai-card">
-          <div className="ai-heading"><span><Icon name="sparkles" size={18} /></span><div><small>Waarschijnlijk</small><strong>Scheurvorming</strong></div><b>92%</b></div>
-          <div className="ai-grid"><div><span>Materiaal</span><strong>Stucwerk</strong></div><div><span>Geschatte maat</span><strong>1,8 m¹</strong></div></div>
-        </div>
-        <Button onClick={() => navigate('f-confirm')}>Controleren</Button>
+        {photo}
+        {resultDetails}
       </div>
     )
   } else {
     content = (
       <div className="screen-content">
-        <SectionTitle eyebrow={activeInspection ? activeInspection.name : 'Foto controleren'} title="Bevestig het gebrek" intro="Pas de AI-velden aan als dat nodig is." />
+        <SectionTitle eyebrow={activeInspection ? activeInspection.name : 'Foto controleren'} title="Bevestig het gebrek" intro="Pas de AI-suggestie aan als dat nodig is." />
         <div className="confirm-photo-row">
-          <img src={PHOTO} alt="Scheur in een witte buitenmuur" />
-          <div><span>AI-herkenning</span><strong>92% zekerheid</strong></div>
+          <img src={draftPhoto ?? PHOTO} alt="Jouw foto van het gebrek" />
+          <div><span>AI-suggestie</span><strong>Voorbeeldwaarde</strong></div>
           <Icon name="sparkles" size={20} />
         </div>
-        <div className="choice-section">
-          <div className="choice-title">Type gebrek</div>
-          <ChipGroup options={['Scheurvorming', 'Vochtschade', 'Loszittend']} value={photoType} onChange={setPhotoType} />
-        </div>
-        <div className="choice-section">
-          <label className="choice-title" htmlFor="photo-measure">Maat</label>
-          <div className="measure-input">
-            <input id="photo-measure" value={photoMeasure} onChange={(event) => setPhotoMeasure(event.target.value)} inputMode="decimal" />
-            <span>m¹</span>
-          </div>
-        </div>
-        <div className="ai-note"><Icon name="sparkles" size={18} /> Automatisch ingevuld op basis van de foto.</div>
-        <Button onClick={() => finish('Gebrek opgeslagen')} icon="check">Opslaan</Button>
+        <DraftFields draft={draft} onChange={setDraft} />
+        {!draftValid && <div className="required-note">Vul type en een maat groter dan 0 in.</div>}
+        <Button onClick={() => saveDefect('foto')} icon="check" disabled={!draftValid}>Opslaan</Button>
       </div>
     )
   }
@@ -991,7 +1251,7 @@ function App() {
   return (
     <main className={`app-shell mode-${deviceMode}`}>
       <div className={`phone device-${deviceMode}`}>
-        {screen !== 'home' && deviceMode === 'ipad' && !isPlanningScreen && <IpadSidebar screen={screen} activeInspection={activeInspection} onNavigate={(next) => next === 'home' ? goHome() : navigate(next)} />}
+        {screen !== 'home' && deviceMode === 'ipad' && !isPlanningScreen && <IpadSidebar screen={screen} activeInspection={activeInspection} defects={defects} onNavigate={(next) => next === 'home' ? goHome() : navigate(next)} />}
         <div className={screen !== 'home' && deviceMode === 'ipad' && !isPlanningScreen ? 'ipad-workspace' : ''}>
           {screen !== 'home' && <Header onBack={goBack} onHome={goHome} label={titleByScreen[screen] ?? ''} />}
           <div className="screen-slide" key={screen}>{content}</div>
